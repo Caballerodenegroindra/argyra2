@@ -1,0 +1,137 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- Helpers ----------
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isSelf(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    function userDoc() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isAdmin() {
+      return signedIn() && userDoc().role == 'admin';
+    }
+
+    function notSuspended() {
+      return signedIn() && userDoc().status != 'suspended';
+    }
+
+    // Campos que el usuario NUNCA puede escribir por su cuenta.
+    function keepsUserFields(before, after) {
+      return after.role == before.role
+        && after.status == before.status
+        && after.uid == before.uid
+        && after.email == before.email
+        && after.createdAt == before.createdAt;
+    }
+
+    // Campos de la comunidad reservados al equipo de Argyra.
+    function keepsCommunityFields(before, after) {
+      return after.ownerUid == before.ownerUid
+        && after.status == before.status
+        && after.isAdminVerified == before.isAdminVerified
+        && after.progress == before.progress
+        && after.createdAt == before.createdAt;
+    }
+
+    // ---------- users ----------
+    match /users/{uid} {
+      allow read: if isSelf(uid) || isAdmin();
+
+      // Alta desde el formulario de registro: siempre pending y rol user.
+      allow create: if isSelf(uid)
+        && request.resource.data.uid == uid
+        && request.resource.data.role == 'user'
+        && request.resource.data.status == 'pending'
+        && request.resource.data.nick is string
+        && request.resource.data.nick.size() >= 3
+        && request.resource.data.nick.size() <= 24
+        && request.resource.data.whatsapp is string
+        && request.resource.data.email == request.auth.token.email;
+
+      // El usuario edita su perfil pero no su rol ni su estado.
+      allow update: if isAdmin()
+        || (isSelf(uid)
+            && notSuspended()
+            && keepsUserFields(resource.data, request.resource.data));
+
+      allow delete: if isAdmin();
+    }
+
+    // ---------- communities ----------
+    match /communities/{communityId} {
+      // La lista de espera es publica una vez que la comunidad fue verificada.
+      // Mientras esta en 'waiting' solo la ven su dueno y el equipo.
+      allow read: if resource.data.status != 'waiting'
+        || isAdmin()
+        || isSelf(resource.data.ownerUid);
+
+      // Se crea durante el registro, con el usuario todavia en 'pending'.
+      allow create: if isSelf(request.resource.data.ownerUid)
+        && request.resource.data.status == 'waiting'
+        && request.resource.data.isAdminVerified == false
+        && request.resource.data.progress == 0
+        && request.resource.data.selectedImprovements.size() == 0
+        && request.resource.data.communityName is string
+        && request.resource.data.communityName.size() >= 3
+        && request.resource.data.communityName.size() <= 60
+        && request.resource.data.ownerNick is string;
+
+      allow update: if isAdmin()
+        || (
+          isSelf(resource.data.ownerUid)
+          && notSuspended()
+          && keepsCommunityFields(resource.data, request.resource.data)
+          && (
+            // Caso 1: la seleccion de mejoras, permitida UNA sola vez.
+            (
+              resource.data.selectedImprovements.size() == 0
+              && request.resource.data.selectedImprovements.size() > 0
+              && request.resource.data.communityName == resource.data.communityName
+            )
+            // Caso 2: el dueno cambia el logo, sin tocar su seleccion.
+            || (
+              request.resource.data.selectedImprovements == resource.data.selectedImprovements
+              && request.resource.data.communityName == resource.data.communityName
+            )
+          )
+        );
+
+      allow delete: if isAdmin();
+    }
+
+    // ---------- requests ----------
+    // El campo notes son los comentarios del equipo hacia el solicitante.
+    match /requests/{requestId} {
+      allow read: if isAdmin() || isSelf(resource.data.userId);
+      allow create: if isSelf(request.resource.data.userId)
+        && request.resource.data.status == 'pending';
+      allow update, delete: if isAdmin();
+    }
+
+    // ---------- improvements ----------
+    // Solo el equipo registra avances; el dueno los consulta.
+    match /improvements/{improvementId} {
+      allow read: if isAdmin()
+        || (
+          signedIn()
+          && exists(/databases/$(database)/documents/communities/$(resource.data.communityId))
+          && get(/databases/$(database)/documents/communities/$(resource.data.communityId)).data.ownerUid == request.auth.uid
+        );
+      allow create, update, delete: if isAdmin();
+    }
+
+    // Todo lo demas queda cerrado.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
